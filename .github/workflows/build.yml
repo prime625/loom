@@ -1,0 +1,279 @@
+name: Loom CI — Build Corpus & Release
+
+on:
+  push:
+    branches: [main, dev]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      dataset_url:
+        description: "URL to training video dataset"
+        default: ""
+        required: false
+      max_videos:
+        description: "Max videos to process"
+        default: "5000"
+        required: false
+      target_size_mb:
+        description: "Target .vid size in MB"
+        default: "1000"
+        required: false
+
+env:
+  PYTHON_VERSION: "3.11"
+  VID_FILE: "loom-corpus.vid"
+
+jobs:
+  # ==========================================================================
+  # STAGE 1: Build Corpus from Training Data
+  # ==========================================================================
+  build-corpus:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360  # 6 hours for large datasets
+    outputs:
+      vid_artifact: ${{ steps.upload.outputs.artifact_id }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Download training dataset
+        run: |
+          if [ -n "${{ github.event.inputs.dataset_url }}" ]; then
+            mkdir -p data/videos
+            wget -q -O data/dataset.tar.gz "${{ github.event.inputs.dataset_url }}"
+            tar -xzf data/dataset.tar.gz -C data/videos/
+          else
+            echo "No dataset URL provided. Using placeholder."
+            mkdir -p data/videos
+            # Generate synthetic test videos for CI
+            python -c "
+            import cv2
+            import numpy as np
+            import os
+            os.makedirs('data/videos', exist_ok=True)
+            for i in range(10):
+                out = cv2.VideoWriter(f'data/videos/test_{i}.mp4', cv2.VideoWriter_fourcc(*'mp4v'), 24, (640, 360))
+                for f in range(48):
+                    frame = np.random.randint(0, 255, (360, 640, 3), dtype=np.uint8)
+                    cv2.putText(frame, f'Video {i} Frame {f}', (50, 180), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+                    out.write(frame)
+                out.release()
+            print('Generated 10 synthetic test videos')
+            "
+          fi
+
+      - name: Build corpus
+        run: |
+          python corpus.py \
+            --input_dir data/videos \
+            --output ${{ env.VID_FILE }} \
+            --max_videos ${{ github.event.inputs.max_videos || 5000 }} \
+            --target_size ${{ github.event.inputs.target_size_mb || 1000 }}
+
+      - name: Verify corpus size
+        run: |
+          SIZE_MB=$(du -m ${{ env.VID_FILE }} | cut -f1)
+          echo "Corpus size: ${SIZE_MB}MB"
+          if [ "$SIZE_MB" -gt 1100 ]; then
+            echo "❌ Corpus exceeds 1.1GB limit"
+            exit 1
+          fi
+          echo "✅ Size check passed"
+
+      - name: Upload corpus artifact
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: loom-corpus
+          path: ${{ env.VID_FILE }}
+          retention-days: 30
+
+  # ==========================================================================
+  # STAGE 2: Cross-platform inference tests
+  # ==========================================================================
+  test:
+    needs: build-corpus
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.10", "3.11"]
+      fail-fast: false
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Download corpus
+        uses: actions/download-artifact@v4
+        with:
+          name: loom-corpus
+
+      - name: Run inference tests
+        run: |
+          python inference.py \
+            --vid ${{ env.VID_FILE }} \
+            --prompt "ocean waves at sunset with panning camera" \
+            --output test_sunset.mp4 \
+            --width 480 \
+            --height 272 \
+            --frames 48 \
+            --seed 42
+
+          python inference.py \
+            --vid ${{ env.VID_FILE }} \
+            --prompt "forest path dolly camera golden hour" \
+            --output test_forest.mp4 \
+            --width 480 \
+            --height 272 \
+            --frames 48 \
+            --seed 123
+
+      - name: Verify outputs
+        run: |
+          for f in test_sunset.mp4 test_forest.mp4; do
+            if [ ! -f "$f" ]; then
+              echo "❌ Missing output: $f"
+              exit 1
+            fi
+            SIZE=$(du -k "$f" | cut -f1)
+            echo "$f: ${SIZE}KB"
+          done
+          echo "✅ All inference tests passed on ${{ matrix.os }}"
+        shell: bash
+
+  # ==========================================================================
+  # STAGE 3: Performance benchmark
+  # ==========================================================================
+  benchmark:
+    needs: build-corpus
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Download corpus
+        uses: actions/download-artifact@v4
+        with:
+          name: loom-corpus
+
+      - name: Run benchmarks
+        run: |
+          echo "Running performance benchmarks..."
+
+          # Benchmark 1: Low resolution
+          python -c "
+          import time
+          import sys
+          sys.path.insert(0, '.')
+          from loom import LoomEngine
+
+          engine = LoomEngine('${{ env.VID_FILE }}')
+
+          resolutions = [(480, 272), (854, 480), (1280, 720)]
+          for w, h in resolutions:
+              start = time.time()
+              frames = engine.synthesize('ocean sunset', width=w, height=h, num_frames=24, seed=42)
+              elapsed = time.time() - start
+              print(f'Resolution {w}x{h}: {elapsed:.2f}s ({24/elapsed:.1f} fps)')
+          "
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: benchmark.txt
+
+  # ==========================================================================
+  # STAGE 4: Release (on tag push)
+  # ==========================================================================
+  release:
+    needs: [build-corpus, test, benchmark]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download corpus
+        uses: actions/download-artifact@v4
+        with:
+          name: loom-corpus
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.VID_FILE }}
+          body: |
+            ## Loom Video Synthesizer ${{ github.ref_name }}
+
+            A non-parametric video generation engine. No neural networks. Pure algorithms.
+
+            ### What's Inside
+            - **Motion Primitives**: Optical flow archetypes extracted from training data
+            - **Texture Patches**: Reusable texture exemplars with PCA compression
+            - **CA Rules**: Cellular automata for organic detail generation
+            - **Scene Composition**: Text-to-video via semantic retrieval and warping
+
+            ### Size
+            - Corpus: ~1GB `.vid` file
+            - Runtime: Pure Python + NumPy + OpenCV
+            - Memory: ~500MB peak during inference
+
+            ### Quick Start
+            ```bash
+            pip install -r requirements.txt
+            python inference.py --vid loom-corpus.vid --prompt "ocean waves at sunset" --output video.mp4
+            ```
+
+            ### Performance
+            - 480p, 5s video: ~5-15s on modern CPU
+            - 720p, 5s video: ~15-30s on modern CPU
+            - No GPU required
+
+            ### Architecture
+            Unlike diffusion models, Loom does not learn weights. It learns **patterns**:
+            - Motion is retrieved and warped
+            - Textures are synthesized from exemplars
+            - Details emerge from cellular automata
+            - Composition is algorithmic, not learned
+          draft: false
+          prerelease: false

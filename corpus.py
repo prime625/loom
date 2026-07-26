@@ -1,6 +1,5 @@
 """
 Loom Corpus Builder
-===================
 Extract motion primitives, texture patches, and CA rules from raw video data.
 No neural network training. Pure signal processing and clustering.
 """
@@ -36,9 +35,7 @@ class MotionExtractor:
         self.method = method
     
     def extract_from_video(self, video_path: str, sample_rate: int = 2) -> List[dict]:
-        """Extract motion primitives from a single video."""
         cap = cv2.VideoCapture(video_path)
-        
         frames = []
         while True:
             ret, frame = cap.read()
@@ -55,7 +52,6 @@ class MotionExtractor:
         
         for i in range(1, len(frames), sample_rate):
             gray = cv2.cvtColor(frames[i], cv2.COLOR_RGB2GRAY)
-            
             if self.method == "farneback":
                 flow = cv2.calcOpticalFlowFarneback(
                     prev_gray, gray, None,
@@ -64,20 +60,16 @@ class MotionExtractor:
                 )
             else:
                 flow = np.zeros((gray.shape[0], gray.shape[1], 2), dtype=np.float32)
-            
             flows.append(flow)
             prev_gray = gray
         
-        primitives = self._segment_flows(flows, frames[0].shape[:2])
-        return primitives
+        return self._segment_flows(flows, frames[0].shape[:2])
     
     def _segment_flows(self, flows: List[np.ndarray], shape: Tuple[int, int]) -> List[dict]:
-        """Segment continuous flow into discrete motion primitives."""
         if not flows:
             return []
         
         flow_stack = np.stack(flows)
-        
         mean_flow = np.mean(flow_stack, axis=(1, 2))
         std_flow = np.std(flow_stack, axis=(1, 2))
         
@@ -101,7 +93,6 @@ class MotionExtractor:
         temporal_mean = np.mean(flow_mag, axis=(1, 2))
         fft = np.fft.fft(temporal_mean)
         spectral = np.abs(fft[:min(64, len(fft))])
-        
         if spectral.max() > 0:
             spectral = spectral / spectral.max()
         
@@ -114,16 +105,12 @@ class MotionExtractor:
 
 
 class TextureExtractor:
-    """Extract reusable texture patches from videos."""
-    
     def __init__(self, patch_size: int = 64, stride: int = 32):
         self.patch_size = patch_size
         self.stride = stride
     
     def extract_from_video(self, video_path: str) -> List[dict]:
-        """Extract texture patches from video frames."""
         cap = cv2.VideoCapture(video_path)
-        
         patches = []
         frame_count = 0
         
@@ -131,7 +118,6 @@ class TextureExtractor:
             ret, frame = cap.read()
             if not ret:
                 break
-            
             if frame_count % 10 != 0:
                 frame_count += 1
                 continue
@@ -142,16 +128,13 @@ class TextureExtractor:
             for y in range(0, h - self.patch_size, self.stride):
                 for x in range(0, w - self.patch_size, self.stride):
                     patch = frame[y:y+self.patch_size, x:x+self.patch_size]
-                    
                     if np.std(patch) < 15:
                         continue
                     
                     category = self._classify_patch(patch)
-                    
                     patch_flat = patch.reshape(-1, 3).astype(np.float32) / 255.0
                     mean = np.mean(patch_flat, axis=0)
                     centered = patch_flat - mean
-                    
                     cov = np.cov(centered.T)
                     eigvals, eigvecs = np.linalg.eigh(cov)
                     idx = np.argsort(eigvals)[::-1]
@@ -163,17 +146,13 @@ class TextureExtractor:
                         "category": category,
                         "scale_range": (0.5, 2.0)
                     })
-            
             frame_count += 1
         
         cap.release()
-        
         return self._deduplicate(patches, max_patches=500)
     
     def _classify_patch(self, patch: np.ndarray) -> str:
-        """Classify patch by dominant color."""
         mean_color = np.mean(patch, axis=(0, 1))
-        
         if mean_color[2] > mean_color[0] + 20 and mean_color[2] > mean_color[1] + 20:
             return "sky"
         elif mean_color[0] > mean_color[1] + 20 and mean_color[0] > mean_color[2] + 20:
@@ -186,22 +165,23 @@ class TextureExtractor:
             return "mixed"
     
     def _deduplicate(self, patches: List[dict], max_patches: int = 500) -> List[dict]:
-        """Keep most diverse patches using greedy selection."""
         if len(patches) <= max_patches:
             return patches
         
         selected = [patches[0]]
-        
         for patch in patches[1:]:
             if len(selected) >= max_patches:
                 break
             
-            patch_hist = cv2.calcHist([patch["patch"]], [0, 1, 2], None, [8, 8, 8], [0, 256, 0, 256, 0, 256]).flatten()
+            patch_hist = cv2.calcHist([patch["patch"]], [0, 1, 2], None, [8, 8, 8], 
+                                      [0, 256, 0, 256, 0, 256]).flatten()
             
             is_diverse = True
             for sel in selected:
-                sel_hist = cv2.calcHist([sel["patch"]], [0, 1, 2], None, [8, 8, 8], [0, 256, 0, 256, 0, 256]).flatten()
-                dist = cv2.compareHist(patch_hist.astype(np.float32), sel_hist.astype(np.float32), cv2.HISTCMP_BHATTACHARYYA)
+                sel_hist = cv2.calcHist([sel["patch"]], [0, 1, 2], None, [8, 8, 8],
+                                        [0, 256, 0, 256, 0, 256]).flatten()
+                dist = cv2.compareHist(patch_hist.astype(np.float32), sel_hist.astype(np.float32),
+                                      cv2.HISTCMP_BHATTACHARYYA)
                 if dist < 0.3:
                     is_diverse = False
                     break
@@ -213,8 +193,6 @@ class TextureExtractor:
 
 
 class CARuleMiner:
-    """Mine cellular automata rules that produce interesting patterns."""
-    
     def __init__(self):
         self.known_rules = {
             "conway": CARule(name="conway", kernel=np.ones((3,3)), birth=[3], survive=[2,3]),
@@ -223,7 +201,6 @@ class CARuleMiner:
         }
     
     def mine_from_texture(self, texture: np.ndarray, num_generations: int = 50) -> Dict[str, CARule]:
-        """Find CA rules that evolve toward a target texture."""
         rules = {}
         for name, base_rule in self.known_rules.items():
             for i in range(3):
@@ -239,22 +216,17 @@ class CARuleMiner:
                     birth=birth,
                     survive=survive
                 )
-        
         return rules
 
 
 class CorpusPacker:
-    """Pack extracted corpus into .vid binary format."""
-    
     def __init__(self):
         self.motion_primitives: List[dict] = []
         self.texture_patches: List[dict] = []
         self.ca_rules: Dict[str, CARule] = {}
     
     def add_video(self, video_path: str):
-        """Process a single video and add to corpus."""
         print(f"Processing {video_path}...")
-        
         motion_ext = MotionExtractor()
         motions = motion_ext.extract_from_video(video_path)
         self.motion_primitives.extend(motions)
@@ -266,13 +238,12 @@ class CorpusPacker:
         print(f"  -> {len(motions)} motion primitives, {len(textures)} texture patches")
     
     def add_ca_rules(self, rules: Dict[str, CARule]):
-        """Add CA rules to corpus."""
         self.ca_rules.update(rules)
     
     def pack(self, output_path: str, target_size_mb: float = 1000.0):
-        """Pack corpus into compressed .vid file."""
         print(f"\nPacking corpus into {output_path}...")
         
+        # Flatten motion primitives
         motion_blocks = []
         for i, mp in enumerate(self.motion_primitives):
             flat = np.concatenate([
@@ -286,6 +257,7 @@ class CorpusPacker:
         
         motion_data = np.concatenate(motion_blocks) if motion_blocks else np.array([], dtype=np.float32)
         
+        # Flatten texture patches
         texture_blocks = []
         for i, tp in enumerate(self.texture_patches):
             flat = np.concatenate([
@@ -299,6 +271,7 @@ class CorpusPacker:
         
         texture_data = np.concatenate(texture_blocks) if texture_blocks else np.array([], dtype=np.float32)
         
+        # Flatten CA rules
         ca_blocks = []
         for name, rule in self.ca_rules.items():
             flat = np.concatenate([
@@ -310,6 +283,7 @@ class CorpusPacker:
         
         ca_data = np.concatenate(ca_blocks) if ca_blocks else np.array([], dtype=np.float32)
         
+        # Metadata
         metadata = {
             "version": 1,
             "num_motion_primitives": len(self.motion_primitives),
@@ -320,6 +294,8 @@ class CorpusPacker:
             "ca_rule_size": len(ca_blocks[0]) if ca_blocks else 0,
             "flow_shape": list(self.motion_primitives[0]["flow_field"].shape) if self.motion_primitives else [0, 0, 0, 0],
             "patch_shape": list(self.texture_patches[0]["patch"].shape) if self.texture_patches else [0, 0, 0],
+            "spectral_size": 64,
+            "pca_components": 24,
             "sections": {
                 "motion": {"id": 0},
                 "texture": {"id": 1},
@@ -327,6 +303,7 @@ class CorpusPacker:
             }
         }
         
+        # Compress sections
         if HAS_LZ4:
             motion_comp = lz4.frame.compress(motion_data.tobytes(), compression_level=9)
             texture_comp = lz4.frame.compress(texture_data.tobytes(), compression_level=9)
@@ -336,31 +313,47 @@ class CorpusPacker:
             texture_comp = zlib.compress(texture_data.tobytes(), level=9)
             ca_comp = zlib.compress(ca_data.tobytes(), level=9)
         
+        # Write .vid file
+        # Format:
+        #   [Header: 32 bytes]
+        #   [Section Directory: 24 bytes * num_sections]
+        #   [Section Data 0]
+        #   [Section Data 1]
+        #   ...
+        #   [Metadata JSON]
+        #   [Metadata Length: 4 bytes]
+        
         with open(output_path, 'wb') as f:
+            # Header
             f.write(b"LOOM")
-            f.write(struct.pack('<H', 1))
-            f.write(struct.pack('<I', 3))
+            f.write(struct.pack('<H', 1))  # version
+            f.write(struct.pack('<H', 3))  # num_sections
+            f.write(b'\x00' * 24)  # reserved
             
+            # Reserve space for section directory
             dir_start = f.tell()
-            f.write(b'\x00' * (3 * (4 + 8 + 4 + 4) + 8))
+            f.write(b'\x00' * (3 * 24))
             
+            # Write section data
             sections_info = []
             for sec_data in [motion_comp, texture_comp, ca_comp]:
                 offset = f.tell()
                 f.write(sec_data)
                 sections_info.append((offset, len(sec_data), len(sec_data) * 2))
             
-            meta_offset = f.tell()
+            # Write metadata
             meta_json = json.dumps(metadata).encode('utf-8')
             f.write(meta_json)
+            f.write(struct.pack('<I', len(meta_json)))
             
+            # Go back and write section directory
             f.seek(dir_start)
             for i, (offset, comp_len, decomp_len) in enumerate(sections_info):
-                f.write(struct.pack('<I', i))
-                f.write(struct.pack('<Q', offset))
-                f.write(struct.pack('<I', comp_len))
-                f.write(struct.pack('<I', decomp_len))
-            f.write(struct.pack('<Q', meta_offset))
+                f.write(struct.pack('<I', i))      # section_id
+                f.write(struct.pack('<Q', offset)) # offset
+                f.write(struct.pack('<I', comp_len))   # comp_len
+                f.write(struct.pack('<I', decomp_len)) # decomp_len
+                f.write(b'\x00' * 4)               # reserved
         
         file_size_mb = Path(output_path).stat().st_size / (1024 * 1024)
         print(f"Packed: {output_path} ({file_size_mb:.1f} MB)")

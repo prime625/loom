@@ -241,52 +241,55 @@ class CorpusPacker:
         self.ca_rules.update(rules)
 
     def pack(self, output_path: str, target_size_mb: float = 1000.0):
-        """Pack corpus into .vid file with VAE imagination layer."""
+        """Pack corpus into .vid file with optional VAE imagination layer."""
         print(f"\nPacking corpus into {output_path}...")
-        
+
         # =====================================================================
-        # STEP 1: Train VAE on texture patches (if PyTorch available)
+        # STEP 1: Train VAE on texture patches (if PyTorch/loom_vae available)
         # =====================================================================
         vae_weights = None
         latent_library = None
         prototypes = None
-        
+
         if self.texture_patches:
             try:
                 from loom_vae import train_vae, compute_prototypes, TinyVAENumpy
-                
+
                 # Extract raw patches
                 raw_patches = [tp["patch"] for tp in self.texture_patches]
                 categories = [tp["category"] for tp in self.texture_patches]
-                
+
                 # Train VAE
                 vae_weights = train_vae(raw_patches, latent_dim=256, epochs=50)
-                
+
                 if vae_weights is not None:
                     # Encode all patches to latents
                     vae = TinyVAENumpy(latent_dim=256)
                     vae.load_weights(vae_weights)
-                    
+
                     latents_list = []
                     for patch in raw_patches:
                         p = patch.astype(np.float32) / 127.5 - 1.0
                         p = p.transpose(2, 0, 1)  # (H,W,C) -> (C,H,W)
                         z = vae.encode(p)
                         latents_list.append(z)
-                    
+
                     latents = np.stack(latents_list)
                     latent_library = latents.astype(np.float32)
-                    
+
                     # Compute category prototypes
                     prototypes = compute_prototypes(latents, categories)
                     print(f"  VAE trained: {len(raw_patches)} patches -> {latents.shape[1]}-dim latents")
                     print(f"  Prototypes: {list(prototypes.keys())}")
             except Exception as e:
-                print(f"  VAE training skipped: {e}")
+                print(f"  VAE training/encoding skipped: {e}")
                 print("  Falling back to raw texture patches.")
-        
+                vae_weights = None
+                latent_library = None
+                prototypes = None
+
         # =====================================================================
-        # STEP 2: Flatten motion primitives (same as before)
+        # STEP 2: Flatten motion primitives
         # =====================================================================
         motion_blocks = []
         for i, mp in enumerate(self.motion_primitives):
@@ -298,9 +301,9 @@ class CorpusPacker:
                 mp["spectral"]
             ]).astype(np.float32)
             motion_blocks.append(flat)
-        
+
         motion_data = np.concatenate(motion_blocks) if motion_blocks else np.array([], dtype=np.float32)
-        
+
         # =====================================================================
         # STEP 3: Flatten texture (raw OR latent)
         # =====================================================================
@@ -330,9 +333,9 @@ class CorpusPacker:
                 "type": "raw",
                 "patch_shape": list(self.texture_patches[0]["patch"].shape) if self.texture_patches else [0, 0, 0],
             }
-        
+
         # =====================================================================
-        # STEP 4: Flatten CA rules (same as before)
+        # STEP 4: Flatten CA rules
         # =====================================================================
         ca_blocks = []
         for name, rule in self.ca_rules.items():
@@ -342,12 +345,20 @@ class CorpusPacker:
                 [float(s) for s in rule.survive] + [0.0] * (3 - len(rule.survive))
             ]).astype(np.float32)
             ca_blocks.append(flat)
-        
+
         ca_data = np.concatenate(ca_blocks) if ca_blocks else np.array([], dtype=np.float32)
-        
+
         # =====================================================================
         # STEP 5: Metadata
         # =====================================================================
+        sections_meta = {
+            "motion": {"id": 0},
+            "texture": {"id": 1},
+            "ca_rules": {"id": 2},
+        }
+        if vae_weights is not None:
+            sections_meta["vae_decoder"] = {"id": 3}
+
         metadata = {
             "version": 2,
             "num_motion_primitives": len(self.motion_primitives),
@@ -357,15 +368,9 @@ class CorpusPacker:
             "texture_meta": texture_meta,
             "ca_rule_size": len(ca_blocks[0]) if ca_blocks else 0,
             "flow_shape": list(self.motion_primitives[0]["flow_field"].shape) if self.motion_primitives else [0, 0, 0, 0],
-            "sections": {
-                "motion": {"id": 0},
-                "texture": {"id": 1},
-                "ca_rules": {"id": 2},
-                "vae_decoder": {"id": 3},
-                "prototypes": {"id": 4},
-            }
+            "sections": sections_meta,
         }
-        
+
         # Add prototype data to metadata (JSON serializable)
         if prototypes is not None:
             metadata["prototypes"] = {
@@ -375,7 +380,7 @@ class CorpusPacker:
                 }
                 for k, v in prototypes.items()
             }
-        
+
         # =====================================================================
         # STEP 6: Compress and write
         # =====================================================================
@@ -383,72 +388,70 @@ class CorpusPacker:
             motion_comp = lz4.frame.compress(motion_data.tobytes(), compression_level=9)
             texture_comp = lz4.frame.compress(texture_data.tobytes(), compression_level=9)
             ca_comp = lz4.frame.compress(ca_data.tobytes(), compression_level=9)
-            vae_comp = lz4.frame.compress(
-                np.concatenate([v.flatten() for v in vae_weights.values() if isinstance(v, np.ndarray)]).tobytes(),
-                compression_level=9
-            ) if vae_weights else b""
         else:
             motion_comp = zlib.compress(motion_data.tobytes(), level=9)
             texture_comp = zlib.compress(texture_data.tobytes(), level=9)
             ca_comp = zlib.compress(ca_data.tobytes(), level=9)
-            vae_comp = zlib.compress(
-                np.concatenate([v.flatten() for v in vae_weights.values() if isinstance(v, np.ndarray)]).tobytes(),
-                level=9
-            ) if vae_weights else b""
-        
+
         with open(output_path, 'wb') as f:
+            # Header
+            num_sections = 4 if vae_weights is not None else 3
             f.write(b"LOOM")
             f.write(struct.pack('<H', 2))  # version 2
-            f.write(struct.pack('<H', 5 if vae_weights else 3))  # num sections
-            f.write(b'\x00' * 24)
-            
+            f.write(struct.pack('<H', num_sections))
+            f.write(b'\x00' * 24)  # reserved
+
+            # Reserve space for section directory
             dir_start = f.tell()
-            num_sections = 5 if vae_weights else 3
             f.write(b'\x00' * (num_sections * 24))
-            
+
+            # Write section data
             sections_info = []
             for sec_data in [motion_comp, texture_comp, ca_comp]:
                 offset = f.tell()
                 f.write(sec_data)
                 sections_info.append((offset, len(sec_data), len(sec_data) * 2))
-            
-            if vae_weights:
-                # Write VAE weights as flat array with header
+
+            # Write VAE weights section if available
+            if vae_weights is not None:
                 vae_header = struct.pack('<I', len(vae_weights))
                 for key, arr in vae_weights.items():
                     if isinstance(arr, np.ndarray):
                         vae_header += struct.pack('<I', len(key)) + key.encode('utf-8')
                         vae_header += struct.pack('<I', arr.size) + struct.pack('<I', arr.dtype.itemsize)
                         vae_header += arr.tobytes()
-                
+
                 offset = f.tell()
                 f.write(vae_header)
                 sections_info.append((offset, len(vae_header), len(vae_header)))
-            
-            meta_offset = f.tell()
+
+            # Write metadata
             meta_json = json.dumps(metadata).encode('utf-8')
             f.write(meta_json)
             f.write(struct.pack('<I', len(meta_json)))
-            
+
+            # Go back and write section directory
             f.seek(dir_start)
             for i, (offset, comp_len, decomp_len) in enumerate(sections_info):
-                f.write(struct.pack('<I', i))
-                f.write(struct.pack('<Q', offset))
-                f.write(struct.pack('<I', comp_len))
-                f.write(struct.pack('<I', decomp_len))
-                f.write(b'\x00' * 4)
-        
+                f.write(struct.pack('<I', i))      # section_id
+                f.write(struct.pack('<Q', offset)) # offset
+                f.write(struct.pack('<I', comp_len))   # comp_len
+                f.write(struct.pack('<I', decomp_len)) # decomp_len
+                f.write(b'\x00' * 4)               # reserved
+
         file_size_mb = Path(output_path).stat().st_size / (1024 * 1024)
         print(f"Packed: {output_path} ({file_size_mb:.1f} MB)")
         print(f"   Motion: {len(self.motion_primitives)} primitives")
         print(f"   Texture: {len(self.texture_patches)} patches ({texture_meta.get('type', 'raw')})")
         print(f"   CA Rules: {len(self.ca_rules)} rules")
-        if vae_weights:
+        if latent_library is not None:
             print(f"   VAE: {latent_library.shape[1]}-dim latent space")
+        if prototypes is not None:
             print(f"   Prototypes: {list(prototypes.keys())}")
-        
+
         if file_size_mb > target_size_mb:
             print(f"Warning: Exceeds {target_size_mb}MB target")
+
 
 def main():
     import argparse
@@ -481,5 +484,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
-    

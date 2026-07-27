@@ -12,3 +12,9 @@ tqdm>=4.66.0
 # Optional: for better text parsing
 # nltk>=3.8.0
 # spacy>=3.7.0
+
+
+
+
+# Training-only (not needed at inference time)
+torch>=2.0.0
